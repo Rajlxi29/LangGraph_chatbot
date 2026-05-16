@@ -3,3 +3,4 @@ langgraph
 streamlit
 python-dotenv
 langchain_openai
+langgraph-checkpoint-sqlite
