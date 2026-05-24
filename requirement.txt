@@ -6,4 +6,7 @@ langchain_openai
 langgraph-checkpoint-sqlite
 pypdf
 sentence-transformers
+langchain-huggingface
+faiss-cpu
 huggingface_hub
+ddgs
