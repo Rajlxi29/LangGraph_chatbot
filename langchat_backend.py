@@ -158,10 +158,8 @@ def rag(query: str, thread_id: Optional[str] = None):
         "source_file": _THREAD_METADATA.get(str(thread_id), {}).get("filename")
     }
 
-tools = [get_stock_price, calc, search_tool]
+tools = [get_stock_price, calc, search_tool, rag]
 llm_tools = model.bind_tools(tools)
-
-
 
 #------------------------------------------------------Graph Creation------------------------------------#
 
@@ -180,9 +178,7 @@ def chatnode(state: ChatState, config = None):
         )
     
     messages = [system, state["messages"]]
-
     response = llm_tools.invoke(messages, cofig = config)
-    
     return {"messages": [response]}
 
 tool_node = ToolNode(tools)
@@ -207,3 +203,9 @@ def get_db_threads():
         thread = check.config["configurable"]["thread_id"]
         s.add(thread)
     return list(s)
+
+def thread_has_document(thread_id: str) -> bool:
+   return str(thread_id) in _THREAD_RETRIVER
+
+def thread_document_metadata(thread_id: str) -> dict:
+    return _THREAD_RETRIVER.get(str(thread_id), {})
