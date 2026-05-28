@@ -12,6 +12,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
+from geopy.geocoders import Nominatim
 from huggingface_hub import login
 from langchain_openai import ChatOpenAI
 import tempfile
@@ -25,10 +26,11 @@ load_dotenv()
 hf_token = os.environ["HF_token"]
 login(hf_token)
 
-embedding = HuggingFaceEmbeddings(model = "sentnce-transformes/all-MiniLM-L6-v2")
+embedding = HuggingFaceEmbeddings(model = "sentence-transformers/all-MiniLM-L6-v2")
 
 _THREAD_RETRIVER: Dict[str, Any] = {}
 _THREAD_METADATA: Dict[str, dict] = {}
+_TOOL_REGISTRY: Dict[str,list] = {}
 
 def get_retriever(thread_id: Optional[str]):
     if thread_id and thread_id in _THREAD_RETRIVER:
@@ -40,9 +42,9 @@ def get_doc(filebytes: bytes, thread_id: str, filename: Optional[str]=None):
     if not filebytes:
         raise ValueError("No bytes recieved from ingestion")
     
-    with tempfile.NamedTemproryFile(delete=False, suffix=".pdf") as tempfile:
-        tempfile.write(filebytes)
-        file_path = tempfile.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp:
+        temp.write(filebytes)
+        file_path = temp.name
 
     try:
         loader = PyPDFLoader(file_path)
@@ -52,7 +54,7 @@ def get_doc(filebytes: bytes, thread_id: str, filename: Optional[str]=None):
         chunks = splitter.split_documents(docs)
 
         vectorstore = FAISS.from_documents(documents = chunks, embedding = embedding)
-        retriver = vectorstore.as_retriever(search_type='similarity', kwargs={'k':4})
+        retriver = vectorstore.as_retriever(search_type='similarity', search_kwargs={'k':4})
 
         _THREAD_RETRIVER[str(thread_id)] = retriver
         _THREAD_METADATA[str(thread_id)] = {
@@ -64,7 +66,7 @@ def get_doc(filebytes: bytes, thread_id: str, filename: Optional[str]=None):
         return {
             "filename": filename or os.path.basename(file_path),
             "document": len(docs),
-            "chunks": len(chunks)
+            "chunks": len(chunks) 
         }
     
     finally:
@@ -87,7 +89,7 @@ class ChatState(TypedDict):
 
 #--------------------------------------------Tool Creation----------------------------------------------------------#
 
-search_tool = DuckDuckGoSearchRun(reqion="us-en")
+search_tool = DuckDuckGoSearchRun(region="us-en")
 
 @tool
 def calc(num1: float, num2: float, op: str):
@@ -137,29 +139,70 @@ def get_stock_price(symbol: str)->str:
     return f"{quote["05. price"]}"
 
 @tool
-def rag(query: str, thread_id: Optional[str] = None):
-    
-    retrieve = get_retriever(thread_id)
+def get_weather_by_city(city_name):
 
-    if retrieve is None:
-        return {
-            "error": "Upload a document to get data",
-            "query": query
-        }
-    
-    result = retrieve.invoke(query)
-    context = [docs.page_content for docs in result]
-    metadata = [docs.metadata for docs in result]
+    """
+    Used for getting the weather of the city
+    mentioned
+    Args:
+    city_name: name of the city to which we have to find the weather
 
-    return{
-        "query": query,
-        "context": context,
-        "metadata": metadata,
-        "source_file": _THREAD_METADATA.get(str(thread_id), {}).get("filename")
+    """
+    geo = Nominatim(user_agent="weather_app")
+    location = geo.geocode(city_name)
+    lat, lon = location.latitude, location.longitude
+
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": ["temperature_2m", "weathercode", "wind_speed_10m"],
+        "timezone": "auto"
     }
 
-tools = [get_stock_price, calc, search_tool, rag]
-llm_tools = model.bind_tools(tools)
+    response = requests.get(url, params = params).json()
+    current = response["current"]
+    return (
+        f"City: {city_name}\n"
+        f"Temperature: {current['temperature_2m']}°C\n"
+        f"Wind Speed: {current['wind_speed_10m']} km/h\n"
+        f"Weather Code: {current['weathercode']}"
+    )
+
+def make_rag_tool(thread_id: str):
+    @tool
+    def rag(query: str)->dict:
+        """
+        For embedding a document and finding 
+        questions and answers related to it
+        
+        """
+        
+        retrieve = get_retriever(thread_id)
+
+        if retrieve is None:
+            return {
+                "error": "Upload a document to get data",
+                "query": query
+            }
+        
+        result = retrieve.invoke(query)
+        context = [docs.page_content for docs in result]
+        metadata = [docs.metadata for docs in result]
+
+        return{
+            "query": query,
+            "context": context,
+            "metadata": metadata,
+            "source_file": _THREAD_METADATA.get(str(thread_id), {}).get("filename")
+        }
+    return rag
+
+def get_tool_for_thread(thread_id: str) -> list:
+    if thread_id not in _TOOL_REGISTRY:
+        rag_tool = make_rag_tool(thread_id)
+        _TOOL_REGISTRY[thread_id] = [get_stock_price, calc, search_tool, rag_tool, get_weather_by_city]
+    return _TOOL_REGISTRY[thread_id]
 
 #------------------------------------------------------Graph Creation------------------------------------#
 
@@ -168,6 +211,9 @@ def chatnode(state: ChatState, config = None):
     thread_id = None
     if config and isinstance(config, dict):
         thread_id = config.get("configurable", {}).get("thread_id")
+
+    tools = get_tool_for_thread(str(thread_id))
+    llm_tools = model.bind_tools(tools)
     
     system = SystemMessage(content= 
             "You are a helpful assistant. For questions about the uploaded PDF, call "
@@ -177,16 +223,24 @@ def chatnode(state: ChatState, config = None):
             "to upload a PDF."
         )
     
-    messages = [system, state["messages"]]
-    response = llm_tools.invoke(messages, cofig = config)
+    messages = [system] + state["messages"]
+    response = llm_tools.invoke(messages)
     return {"messages": [response]}
 
-tool_node = ToolNode(tools)
+def route_tools(state: ChatState, config = None):
+    thread_id = ""
+    if config and isinstance(config, dict):
+        thread_id = str(config.get("configurable", {}).get("thread_id", ""))
+    
+    tools = get_tool_for_thread(thread_id)
+    tool_node = ToolNode(tools)
+
+    return tool_node
 
 graph = StateGraph(ChatState)
 
 graph.add_node("chatnode", chatnode)
-graph.add_node("tools", tool_node)
+graph.add_node("tools", route_tools)
 
 graph.add_edge(START, "chatnode")
 graph.add_conditional_edges("chatnode", tools_condition)
@@ -208,4 +262,4 @@ def thread_has_document(thread_id: str) -> bool:
    return str(thread_id) in _THREAD_RETRIVER
 
 def thread_document_metadata(thread_id: str) -> dict:
-    return _THREAD_RETRIVER.get(str(thread_id), {})
+    return _THREAD_METADATA.get(str(thread_id), {})

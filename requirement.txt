@@ -10,3 +10,4 @@ langchain-huggingface
 faiss-cpu
 huggingface_hub
 ddgs
+geopy
